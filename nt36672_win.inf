@@ -1,0 +1,68 @@
+;
+; nt36672_win.inf - Minidriver HID (KMDF + mshidkmdf) for touch NT36672A
+; Redmi Note 8 (ginkgo), Windows 10 ARM64
+;
+; Compara con el INF de vhidmini2 (Windows-driver-samples/hid/vhidmini2).
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%ManufacturerName%
+CatalogFile=nt36672_win.cat
+DriverVer=10/12/2026,1.0.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+nt36672_win.sys = 1,,
+novatek_ts_tianma_fw.bin=1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTarm64
+
+[Standard.NTarm64]
+%DeviceDesc% = nt36672_win_Device, ACPI\NT03672A
+
+[nt36672_win_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+nt36672_win.sys
+novatek_ts_tianma_fw.bin
+
+; mshidkmdf como filtro superior (pasa los IRP al minidriver KMDF)
+[nt36672_win_Device.NT.HW]
+AddReg = nt36672_win_AddReg
+
+[nt36672_win_AddReg]
+HKR,,"UpperFilters",0x00010000,"mshidkmdf"
+
+[nt36672_win_Device.NT.Services]
+AddService = nt36672_win,0x00000002,nt36672_win_Service
+
+[nt36672_win_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\nt36672_win.sys
+
+[nt36672_win_Device.NT.Wdf]
+KmdfService = nt36672_win, nt36672_win_wdfsect
+
+[nt36672_win_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000002
+ManufacturerName = "woa-ginkllow"
+DiskName         = "NT36672A Touch Disk"
+DeviceDesc       = "NT36672A Touch (Redmi Note 8)"
+ServiceDesc      = "NT36672A Touch Service"
