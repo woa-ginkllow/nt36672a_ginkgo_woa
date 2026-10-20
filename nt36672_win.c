@@ -85,7 +85,11 @@ typedef struct _DEVICE_CONTEXT {
     WDFQUEUE ReadQueue;
     WDFTIMER PollTimer;
     ULONG    Tick;
-    ULONG PrevMask; BOOLEAN Ready;
+    volatile LONG Busy;
+    BOOLEAN       Ready;
+    BOOLEAN       HavePending;
+    ULONG         PrevMask;
+    VIZ_TOUCH_REPORT Pending;
 } DEVICE_CONTEXT, * PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetCtx)
@@ -775,28 +779,37 @@ static VOID NvtGetFwInfo(PDEVICE_CONTEXT c)
     NqPage(c, NVT_EVENT_BUF);                   /* dejar la pagina lista para los eventos */
 }
 
-/* Arranque completo del touch. Llamar en PASSIVE_LEVEL (EvtPrepareHardware). */
+static PUCHAR g_Fw = NULL;
+static ULONG  g_FwLen = 0;
+
 static NTSTATUS NvtBringUp(PDEVICE_CONTEXT c)
 {
-    PUCHAR fw = NULL;
-    ULONG fwLen = 0;
     NTSTATUS st;
-    int pr;
-
     if (!NvtAllocBufs()) return STATUS_INSUFFICIENT_RESOURCES;
-    st = NvtLoadFile(&fw, &fwLen);
+
+    if (!g_Fw) {                                  /* se carga y parsea una sola vez */
+        st = NvtLoadFile(&g_Fw, &g_FwLen);
+        if (!NT_SUCCESS(st)) { g_Fw = NULL; return st; }
+        if (NvtParseBin(g_Fw, g_FwLen)) {
+            ExFreePoolWithTag(g_Fw, 'wFzV'); g_Fw = NULL;
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        VizLog("fw: len=%lu particiones=%lu", g_FwLen, g_PartCnt);
+    }
+
+    st = NvtDownloadFw(c, g_Fw, g_FwLen);
     if (!NT_SUCCESS(st)) return st;
-
-    pr = NvtParseBin(fw, fwLen);
-    VizLog("fw: len=%lu parse=%d particiones=%lu", fwLen, pr, g_PartCnt);
-    if (pr) { ExFreePoolWithTag(fw, 'wFzV'); return STATUS_INVALID_IMAGE_FORMAT; }
-
-    st = NvtDownloadFw(c, fw, fwLen);
-    ExFreePoolWithTag(fw, 'wFzV');
-    if (!NT_SUCCESS(st)) return st;
-
     NvtGetFwInfo(c);
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS VizTouchStart(PDEVICE_CONTEXT c)
+{
+    VizEnableClocks(c);
+    VizSpiPinmux(c);
+    VizGeniInit(c);
+    VizSpiSetup(c);
+    return NvtBringUp(c);
 }
 
 /* ------------------------- lectura de eventos -------------------------- */
@@ -985,24 +998,31 @@ VOID EvtIoInternalDeviceControl(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request,
 VOID EvtPollTimer(_In_ WDFTIMER Timer)
 {
     PDEVICE_CONTEXT c = GetCtx(WdfTimerGetParentObject(Timer));
-    VIZ_TOUCH_REPORT rep;
     WDFREQUEST req;
     PVOID out;
     NTSTATUS st;
 
-    if (!VizReadTouch(c, &rep)) return;
+    if (!c->Ready) return;
+    if (InterlockedCompareExchange(&c->Busy, 1, 0)) return;
 
-    st = WdfIoQueueRetrieveNextRequest(c->ReadQueue, &req);
-    if (!NT_SUCCESS(st)) return;
+    if (!c->HavePending && VizReadTouch(c, &c->Pending))
+        c->HavePending = TRUE;
 
-    st = WdfRequestRetrieveOutputBuffer(req, sizeof(rep), &out, NULL);
-    if (NT_SUCCESS(st)) {
-        RtlCopyMemory(out, &rep, sizeof(rep));
-        WdfRequestCompleteWithInformation(req, STATUS_SUCCESS, sizeof(rep));
+    if (c->HavePending) {
+        st = WdfIoQueueRetrieveNextRequest(c->ReadQueue, &req);
+        if (NT_SUCCESS(st)) {
+            st = WdfRequestRetrieveOutputBuffer(req, sizeof(c->Pending), &out, NULL);
+            if (NT_SUCCESS(st)) {
+                RtlCopyMemory(out, &c->Pending, sizeof(c->Pending));
+                WdfRequestCompleteWithInformation(req, STATUS_SUCCESS, sizeof(c->Pending));
+            }
+            else {
+                WdfRequestComplete(req, st);
+            }
+            c->HavePending = FALSE;
+        }
     }
-    else {
-        WdfRequestComplete(req, st);
-    }
+    InterlockedExchange(&c->Busy, 0);
 }
 
 /* ------------------------------ PnP ------------------------------------ */
@@ -1036,6 +1056,9 @@ NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, DEVICE_CONTEXT);
     st = WdfDeviceCreate(&DeviceInit, &attr, &dev);
+
+    WDF_TIMER_CONFIG_INIT_PERIODIC(&tc, EvtPollTimer, VIZ_POLL_MS);
+    tc.AutomaticSerialization = FALSE;
     if (!NT_SUCCESS(st)) return st;
 
     PDEVICE_CONTEXT c = GetCtx(dev);
@@ -1089,35 +1112,11 @@ NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw, _In_ W
     }
     VizLog("mapeado SE2=%p TLMM=%p GCC=%p", c->Se, c->Tlmm, c->Gcc);
 
-#if VIZ_HW_DIAG
-    if (c->Tlmm && c->Gcc) {
-        VizTlmmDump(c);
-        VizClkDump(c);
-        VizEnableClocks(c);
-        VizClkCheck(c);
-        VizFlushLog();
-
-        VizMarker(L"seprobe", 0, 0);
-        VizSpiProbe(c);
-
-        if (c->Se) {
-            ULONG fw = READ_REGISTER_ULONG((PULONG)((PUCHAR)c->Se + 0x068));
-            VizLog("GENI_INIT_CFG_REV=0x%08lx", READ_REGISTER_ULONG((PULONG)((PUCHAR)c->Se + 0x000)));
-            VizLog("FW_REV=0x%08lx proto=%lu", fw, (fw >> 8) & 0xFF);
-            VizLog("GENI_STATUS=0x%08lx", READ_REGISTER_ULONG((PULONG)((PUCHAR)c->Se + 0x040)));
-        }
-        VizFlushLog();
-    }
-#endif
-
 #if !VIZ_TEST_FAKE_TOUCH
-    if (c->Se && c->Tlmm && c->Gcc) {
-        VizEnableClocks(c);
-        VizSpiPinmux(c);
-        VizGeniInit(c);
-        VizSpiSetup(c);          /* con DEMUX_OUT_INV = 0 */
-        NTSTATUS fs = NvtBringUp(c);
-        VizLog("NvtBringUp st=%08lx", (ULONG)fs);
+    if (!c->Se || !c->Tlmm || !c->Gcc) return STATUS_DEVICE_CONFIGURATION_ERROR;
+    {
+        NTSTATUS fs = VizTouchStart(c);
+        VizLog("VizTouchStart st=%08lx", (ULONG)fs);
         c->Ready = NT_SUCCESS(fs);
         VizFlushLog();
     }
@@ -1139,16 +1138,27 @@ NTSTATUS EvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Translated)
 
 NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Prev)
 {
-    UNREFERENCED_PARAMETER(Prev);
     PDEVICE_CONTEXT c = GetCtx(Device);
     c->Tick = 0;
+    c->PrevMask = 0;
+    c->HavePending = FALSE;
+
+    /* En el primer arranque PrepareHardware ya lo hizo; al volver de D3/D2 hay que repetirlo */
+    if (Prev != WdfPowerDeviceD3Final && c->Se && c->Tlmm && c->Gcc) {
+        NTSTATUS st = VizTouchStart(c);
+        VizLog("resume st=%08lx", (ULONG)st);
+        c->Ready = NT_SUCCESS(st);
+        VizFlushLog();
+    }
     WdfTimerStart(c->PollTimer, WDF_REL_TIMEOUT_IN_MS(VIZ_POLL_MS));
     return STATUS_SUCCESS;
 }
 
 NTSTATUS EvtD0Exit(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE Target)
 {
+    PDEVICE_CONTEXT c = GetCtx(Device);
     UNREFERENCED_PARAMETER(Target);
-    WdfTimerStop(GetCtx(Device)->PollTimer, TRUE);
+    WdfTimerStop(c->PollTimer, TRUE);
+    c->Ready = FALSE;
     return STATUS_SUCCESS;
 }
