@@ -2,3 +2,6 @@
 
 ## status
 working well except for PMIC
+
+## Panel Support
+Only Tianma Panel is supported for now but soon i will support EBBG Panel
